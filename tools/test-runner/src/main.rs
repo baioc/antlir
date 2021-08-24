@@ -106,8 +106,8 @@ fn main() -> Result<()> {
     let mut tests: Vec<TestResult> = tests
         .into_par_iter()
         .map(|test| {
-            let run = !disabled.contains(&(test.target.clone(), test.unit.clone()));
-            let test =  if run {
+            let run = !disabled.contains(&(test.target.clone(), test.unit.clone())) || options.run_disabled;
+            let test = if run {
                 test.run(options.retries)
             } else {
                 TestResult {
