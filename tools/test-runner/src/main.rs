@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use itertools::Itertools;
 use rayon::iter::*;
 use structopt::{clap, StructOpt};
-use postgres::{Client, NoTls};
+use postgres::{Client, NoTls, IsolationLevel};
 
 // we declare all modules here so that they may refer to each other using `super::<mod>`
 mod buck_test;
@@ -88,14 +88,14 @@ fn main() -> Result<()> {
     }
 
     // connect to DB when it is provided
-    let db = match options.conn {
+    let mut db = match options.conn {
         None => None,
         Some(ref uri) => Some(
             Client::connect(&uri, NoTls)
                 .with_context(|| format!("Couldn't connect to specified test DB at '{}'", uri))?
         )
     };
-    let disabled = query_disabled(db);
+    let disabled = query_disabled(&mut db);
 
     // run tests in parallel (retries share the same thread)
     let total = tests.len();
@@ -171,17 +171,21 @@ fn main() -> Result<()> {
     }
     println!("Out of {} tests, {} passed, {} failed, {} were skipped", total, passed, failed, skipped);
 
-    // generate test report
+    // generate outputs
     match options.report {
         None => (),
-        Some(path) => report(tests, path)?,
+        Some(path) => report(&tests, path)?,
+    }
+    match options.revision {
+        None => (),
+        Some(revision) => query_commit(&mut db, revision, &tests)?,
     }
 
     exit(failed as i32);
 }
 
 // Refer to https://llg.cubic.org/docs/junit/
-fn report<P: AsRef<Path>>(tests: Vec<TestResult>, path: P) -> Result<()> {
+fn report<P: AsRef<Path>>(tests: &Vec<TestResult>, path: P) -> Result<()> {
     let path = path.as_ref();
     let file = File::create(&path).with_context(|| {
         format!(
@@ -212,9 +216,9 @@ fn report<P: AsRef<Path>>(tests: Vec<TestResult>, path: P) -> Result<()> {
                 writeln!(xml, r#">"#)?;
                 writeln!(xml, r#"      <failure>Test failed after {} unsuccessful attempts</failure>"#, test.attempts)?;
                 writeln!(xml, r#"      <system-out>{}</system-out>"#,
-                              xml_escape_text(test.stdout))?;
+                              xml_escape_text(&test.stdout))?;
                 writeln!(xml, r#"      <system-err>{}</system-err>"#,
-                              xml_escape_text(test.stderr))?;
+                              xml_escape_text(&test.stderr))?;
                 writeln!(xml, r#"    </testcase>"#)?;
             }
         }
@@ -228,14 +232,16 @@ fn report<P: AsRef<Path>>(tests: Vec<TestResult>, path: P) -> Result<()> {
     return Ok(());
 }
 
-fn xml_escape_text(unescaped: String) -> String {
+fn xml_escape_text(unescaped: &String) -> String {
     return unescaped.replace("<", "&lt;").replace("&", "&amp;");
 }
 
-fn query_disabled(db: Option<Client>) -> HashSet<(String, Option<String>)> {
+fn query_disabled(db: &mut Option<Client>) -> HashSet<(String, Option<String>)> {
+    // we have unit test name as NOT NULL in the DB, so empty SQL strings are
+    // converted to Option types in Rust, the same inverse should be done on writes
     match db {
         None => HashSet::new(),
-        Some(mut db) =>
+        Some(db) =>
             db.query("SELECT target, test FROM tests WHERE disabled = true", &[])
             .unwrap()
             .into_iter()
@@ -246,5 +252,32 @@ fn query_disabled(db: Option<Client>) -> HashSet<(String, Option<String>)> {
                 return (target, test);
             })
             .collect(),
+    }
+}
+
+fn query_commit(db: &mut Option<Client>, revision: String, tests: &Vec<TestResult>) -> Result<()> {
+    match db {
+        None => Ok(()),
+        Some(db) => {
+            let mut transaction = db.build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()?;
+
+            // we assume PostgreSQL > 9.5 in order to use <ON CONFLICT>
+            transaction.execute("INSERT INTO runs (revision) VALUES ($1)", &[&revision])?;
+            for test in tests {
+                let target = &test.target;
+                transaction.execute("INSERT INTO targets (target) VALUES ($1) ON CONFLICT DO NOTHING", &[target])?;
+                let unit = &test.unit.as_deref().unwrap_or(&"").to_string();
+                transaction.execute("INSERT INTO tests (target, test, disabled) VALUES ($1, $2, false) ON CONFLICT DO NOTHING", &[target, unit])?;
+                if test.attempts > 0 {
+                    let passing = test.passed;
+                    transaction.execute("INSERT INTO results (revision, target, test, passing) VALUES ($1, $2, $3, $4)", &[&revision, target, unit, &passing])?;
+                }
+            }
+
+            transaction.commit()?;
+            Ok(())
+        }
     }
 }
