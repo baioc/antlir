@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use itertools::Itertools;
@@ -14,7 +16,7 @@ mod buck_test;
 mod pyunit;
 mod rust;
 
-use buck_test::{Test, TestResult};
+use buck_test::{Test, TestResult, test_name};
 
 #[derive(StructOpt, Debug)]
 #[structopt(
@@ -38,9 +40,9 @@ struct Options {
     #[structopt(long = "state")]
     conn: Option<String>,
 
-    /// Enables writing to the test DB on stateful runs. Default is read-only
-    #[structopt(long = "write", short, requires("conn"))]
-    write: bool,
+    /// Commit SHA-1 used to update the test DB on stateful runs
+    #[structopt(long = "commit", requires("conn"))]
+    revision: Option<String>,
 
     /// Forces auto-disabled tests to run
     #[structopt(long = "run-disabled")]
@@ -80,21 +82,22 @@ fn main() -> Result<()> {
     // don't run anything when just listing
     if options.list {
         for test in tests {
-            println!("{}", test.name);
+           println!("{}", test_name(&test.target, &test.unit));
         }
         exit(0);
     }
 
     // connect to DB when it is provided
-    let mut db = match options.conn {
+    let db = match options.conn {
         None => None,
         Some(ref uri) => Some(
             Client::connect(&uri, NoTls)
                 .with_context(|| format!("Couldn't connect to specified test DB at '{}'", uri))?
         )
     };
+    let disabled = query_disabled(db);
 
-    // run tests in parallel
+    // run tests in parallel (retries share the same thread)
     let total = tests.len();
     eprintln!("Found {} tests...", total);
     let _ = rayon::ThreadPoolBuilder::new()
@@ -103,32 +106,53 @@ fn main() -> Result<()> {
     let mut tests: Vec<TestResult> = tests
         .into_par_iter()
         .map(|test| {
-            // retries share the same thread
-            let test = test.run(options.retries);
+            let run = !disabled.contains(&(test.target.clone(), test.unit.clone()));
+            let test =  if run {
+                test.run(options.retries)
+            } else {
+                TestResult {
+                    target: test.target,
+                    unit: test.unit,
+                    attempts: 0,
+                    passed: false,
+                    duration: Duration::ZERO,
+                    stdout: "".to_string(),
+                    stderr: "".to_string(),
+                    contacts: test.contacts,
+                }
+            };
+
+            let name = test_name(&test.target, &test.unit);
             if test.passed {
-                print!("[PASS] {} ({} ms)", test.name, test.duration.as_millis());
+                print!("[PASS] {} ({} ms)", name, test.duration.as_millis());
                 if test.attempts > 1 {
                     print!(" ({} attempts needed)\n", test.attempts);
                 } else {
                     print!("\n");
                 }
+            } else if test.attempts == 0 {
+                println!("[SKIP] {}", name);
             } else {
-                println!("[FAIL] {} ({} ms)", test.name, test.duration.as_millis());
+                println!("[FAIL] {} ({} ms)", name, test.duration.as_millis());
             }
+
             return test;
         })
         .collect();
 
     // collect and print results
     let mut passed = 0;
+    let mut skipped = 0;
     let mut errors: Vec<String> = Vec::new();
     for test in tests.iter_mut() {
         if test.passed {
             passed += 1;
+        } else if test.attempts == 0 {
+            skipped += 1;
         } else {
             let mut message = format!(
                 "\nTest {} failed after {} unsuccessful attempts:\n",
-                test.name, test.attempts
+                test_name(&test.target, &test.unit), test.attempts
             );
             for line in test.stderr.split("\n") {
                 let line = format!("    {}\n", line);
@@ -141,11 +165,11 @@ fn main() -> Result<()> {
             errors.push(message);
         }
     }
+    let failed = errors.len();
     for error in errors {
         eprintln!("{}", error);
     }
-    let failed = total - passed;
-    println!("Out of {} tests, {} passed, {} failed", total, passed, failed);
+    println!("Out of {} tests, {} passed, {} failed, {} were skipped", total, passed, failed, skipped);
 
     // generate test report
     match options.report {
@@ -167,32 +191,21 @@ fn report<P: AsRef<Path>>(tests: Vec<TestResult>, path: P) -> Result<()> {
     })?;
     let mut xml = BufWriter::new(&file);
 
-    let failures = tests.iter().filter(|test| !test.passed).count();
+    let failures = tests.iter().filter(|test| !test.passed && test.attempts > 0).count();
     writeln!(xml, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
     writeln!(xml, r#"<testsuites tests="{}" failures="{}">"#, tests.len(), failures)?;
 
     // we group unit tests from the same buck target as a JUnit "testsuite"
-    let suites = tests
-        .into_iter()
-        .map(|test| {
-            let name: Vec<&str> = test.name.split("#").collect();
-            let target = name[0].to_owned();
-            let unit = if name.len() > 1 {
-                name[1].to_owned()
-            } else {
-                target.clone()
-            };
-            return (target, unit, test);
-        })
-        .into_group_map_by(|(target, _, _)| target.to_owned());
+    let suites = tests.into_iter().into_group_map_by(|test| test.target.clone());
     for (target, cases) in suites {
-        let failures = cases.iter().filter(|(_, _, test)| !test.passed).count();
-        writeln!(xml, r#"  <testsuite name="{}" tests="{}" failures="{}">"#,
-                      target, cases.len(), failures)?;
+        let failures = cases.iter().filter(|test| !test.passed && test.attempts > 0).count();
+        let skipped = cases.iter().filter(|test| !test.passed && test.attempts == 0).count();
+        writeln!(xml, r#"  <testsuite name="{}" tests="{}" failures="{}" skipped="{}">"#,
+                      target, cases.len(), failures, skipped)?;
 
-        for (target, unit, test) in cases {
+        for test in cases {
             write!(xml, r#"    <testcase classname="{}" name="{}" time="{}""#,
-                        target, unit, test.duration.as_millis() as f32 / 1e3)?;
+                        &test.target, test.unit.as_ref().unwrap_or(&test.target), test.duration.as_millis() as f32 / 1e3)?;
             if test.passed {
                 writeln!(xml, " />")?;
             } else {
@@ -217,4 +230,21 @@ fn report<P: AsRef<Path>>(tests: Vec<TestResult>, path: P) -> Result<()> {
 
 fn xml_escape_text(unescaped: String) -> String {
     return unescaped.replace("<", "&lt;").replace("&", "&amp;");
+}
+
+fn query_disabled(db: Option<Client>) -> HashSet<(String, Option<String>)> {
+    match db {
+        None => HashSet::new(),
+        Some(mut db) =>
+            db.query("SELECT target, test FROM tests WHERE disabled = true", &[])
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                let target = row.get("target");
+                let test = row.get("test");
+                let test = if test == "" { None } else { Some(test) };
+                return (target, test);
+            })
+            .collect(),
+    }
 }
