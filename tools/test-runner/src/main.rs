@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use itertools::Itertools;
 use rayon::iter::*;
 use structopt::{clap, StructOpt};
+use postgres::{Client, NoTls};
 
 // we declare all modules here so that they may refer to each other using `super::<mod>`
 mod buck_test;
@@ -25,23 +26,35 @@ struct Options {
     #[structopt(long = "buck-test-info")]
     spec: PathBuf,
 
-    /// Lists all unit tests and exits without running them
-    #[structopt(long)]
+    /// Lists unit tests and exits without running them
+    #[structopt(long, short)]
     list: bool,
 
     /// Path to generated test report in JUnit XML format
     #[structopt(long = "xml")]
     report: Option<PathBuf>,
 
+    /// Connection string of the DB used in stateful test runs
+    #[structopt(long = "state")]
+    conn: Option<String>,
+
+    /// Enables writing to the test DB on stateful runs. Default is read-only
+    #[structopt(long = "write", short, requires("conn"))]
+    write: bool,
+
+    /// Forces auto-disabled tests to run
+    #[structopt(long = "run-disabled")]
+    run_disabled: bool,
+
     /// Maximum number of times a failing unit test will be retried
-    #[structopt(long = "max-retries", default_value = "0")]
+    #[structopt(long = "max-retries", short = "r", default_value = "0")]
     retries: u32,
 
     /// Maximum number of concurrent tests. Passed in by buck test
     #[structopt(long = "jobs", default_value = "1")]
     threads: usize,
 
-    /// Warns on any further options for forward compatibility with buck test
+    /// Warns on any further options for forward compatibility with buck
     #[structopt(hidden = true)]
     ignored: Vec<String>,
 }
@@ -72,18 +85,28 @@ fn main() -> Result<()> {
         exit(0);
     }
 
-    // run tests in parallel (retries share the same thread)
+    // connect to DB when it is provided
+    let mut db = match options.conn {
+        None => None,
+        Some(ref uri) => Some(
+            Client::connect(&uri, NoTls)
+                .with_context(|| format!("Couldn't connect to specified test DB at '{}'", uri))?
+        )
+    };
+
+    // run tests in parallel
     let total = tests.len();
-    eprintln!("Running {} tests...", total);
+    eprintln!("Found {} tests...", total);
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads)
         .build_global();
     let mut tests: Vec<TestResult> = tests
         .into_par_iter()
         .map(|test| {
+            // retries share the same thread
             let test = test.run(options.retries);
             if test.passed {
-                print!("[OK] {} ({} ms)", test.name, test.duration.as_millis());
+                print!("[PASS] {} ({} ms)", test.name, test.duration.as_millis());
                 if test.attempts > 1 {
                     print!(" ({} attempts needed)\n", test.attempts);
                 } else {
