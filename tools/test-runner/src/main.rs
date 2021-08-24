@@ -7,16 +7,16 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use itertools::Itertools;
+use postgres::{Client, NoTls};
 use rayon::iter::*;
 use structopt::{clap, StructOpt};
-use postgres::{Client, NoTls};
 
 // we declare all modules here so that they may refer to each other using `super::<mod>`
 mod buck_test;
 mod pyunit;
 mod rust;
 
-use buck_test::{Test, TestResult, test_name};
+use buck_test::{test_name, Test, TestResult};
 
 #[derive(StructOpt, Debug)]
 #[structopt(
@@ -37,7 +37,7 @@ struct Options {
     report: Option<PathBuf>,
 
     /// Connection string of the DB used in stateful test runs
-    #[structopt(long = "state")]
+    #[structopt(long = "db")]
     conn: Option<String>,
 
     /// Commit SHA-1 used to update the test DB on stateful runs
@@ -72,8 +72,7 @@ fn main() -> Result<()> {
     }
 
     // validate and collect tests which are not auto-excluded
-    let tests: Vec<Test> =
-        buck_test::read(&options.spec)?
+    let tests: Vec<Test> = buck_test::read(&options.spec)?
         .into_iter()
         .map(|spec| buck_test::validate(spec).unwrap())
         .flatten()
@@ -82,7 +81,7 @@ fn main() -> Result<()> {
     // don't run anything when just listing
     if options.list {
         for test in tests {
-           println!("{}", test_name(&test.target, &test.unit));
+            println!("{}", test_name(&test.target, &test.unit));
         }
         exit(0);
     }
@@ -92,8 +91,8 @@ fn main() -> Result<()> {
         None => None,
         Some(ref uri) => Some(
             Client::connect(&uri, NoTls)
-                .with_context(|| format!("Couldn't connect to specified test DB at '{}'", uri))?
-        )
+                .with_context(|| format!("Couldn't connect to specified test DB at '{}'", uri))?,
+        ),
     };
     let disabled = query_disabled(&mut db);
 
@@ -106,7 +105,8 @@ fn main() -> Result<()> {
     let mut tests: Vec<TestResult> = tests
         .into_par_iter()
         .map(|test| {
-            let run = !disabled.contains(&(test.target.clone(), test.unit.clone())) || options.run_disabled;
+            let run = !disabled.contains(&(test.target.clone(), test.unit.clone()))
+                || options.run_disabled;
             let test = if run {
                 test.run(options.retries)
             } else {
@@ -152,7 +152,8 @@ fn main() -> Result<()> {
         } else {
             let mut message = format!(
                 "\nTest {} failed after {} unsuccessful attempts:\n",
-                test_name(&test.target, &test.unit), test.attempts
+                test_name(&test.target, &test.unit),
+                test.attempts
             );
             for line in test.stderr.split("\n") {
                 let line = format!("    {}\n", line);
@@ -169,7 +170,10 @@ fn main() -> Result<()> {
     for error in errors {
         eprintln!("{}", error);
     }
-    println!("Out of {} tests, {} passed, {} failed, {} were skipped", total, passed, failed, skipped);
+    println!(
+        "Out of {} tests, {} passed, {} failed, {} were skipped",
+        total, passed, failed, skipped
+    );
 
     // generate outputs
     match options.report {
@@ -195,30 +199,67 @@ fn report<P: AsRef<Path>>(tests: &Vec<TestResult>, path: P) -> Result<()> {
     })?;
     let mut xml = BufWriter::new(&file);
 
-    let failures = tests.iter().filter(|test| !test.passed && test.attempts > 0).count();
+    let failures = tests
+        .iter()
+        .filter(|test| !test.passed && test.attempts > 0)
+        .count();
     writeln!(xml, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
-    writeln!(xml, r#"<testsuites tests="{}" failures="{}">"#, tests.len(), failures)?;
+    writeln!(
+        xml,
+        r#"<testsuites tests="{}" failures="{}">"#,
+        tests.len(),
+        failures
+    )?;
 
     // we group unit tests from the same buck target as a JUnit "testsuite"
-    let suites = tests.into_iter().into_group_map_by(|test| test.target.clone());
+    let suites = tests
+        .into_iter()
+        .into_group_map_by(|test| test.target.clone());
     for (target, cases) in suites {
-        let failures = cases.iter().filter(|test| !test.passed && test.attempts > 0).count();
-        let skipped = cases.iter().filter(|test| !test.passed && test.attempts == 0).count();
-        writeln!(xml, r#"  <testsuite name="{}" tests="{}" failures="{}" skipped="{}">"#,
-                      target, cases.len(), failures, skipped)?;
+        let failures = cases
+            .iter()
+            .filter(|test| !test.passed && test.attempts > 0)
+            .count();
+        let skipped = cases
+            .iter()
+            .filter(|test| !test.passed && test.attempts == 0)
+            .count();
+        writeln!(
+            xml,
+            r#"  <testsuite name="{}" tests="{}" failures="{}" skipped="{}">"#,
+            target,
+            cases.len(),
+            failures,
+            skipped
+        )?;
 
         for test in cases {
-            write!(xml, r#"    <testcase classname="{}" name="{}" time="{}""#,
-                        &test.target, test.unit.as_ref().unwrap_or(&test.target), test.duration.as_millis() as f32 / 1e3)?;
+            write!(
+                xml,
+                r#"    <testcase classname="{}" name="{}" time="{}""#,
+                &test.target,
+                test.unit.as_ref().unwrap_or(&test.target),
+                test.duration.as_millis() as f32 / 1e3
+            )?;
             if test.passed {
                 writeln!(xml, " />")?;
             } else {
                 writeln!(xml, r#">"#)?;
-                writeln!(xml, r#"      <failure>Test failed after {} unsuccessful attempts</failure>"#, test.attempts)?;
-                writeln!(xml, r#"      <system-out>{}</system-out>"#,
-                              xml_escape_text(&test.stdout))?;
-                writeln!(xml, r#"      <system-err>{}</system-err>"#,
-                              xml_escape_text(&test.stderr))?;
+                writeln!(
+                    xml,
+                    r#"      <failure>Test failed after {} unsuccessful attempts</failure>"#,
+                    test.attempts
+                )?;
+                writeln!(
+                    xml,
+                    r#"      <system-out>{}</system-out>"#,
+                    xml_escape_text(&test.stdout)
+                )?;
+                writeln!(
+                    xml,
+                    r#"      <system-err>{}</system-err>"#,
+                    xml_escape_text(&test.stderr)
+                )?;
                 writeln!(xml, r#"    </testcase>"#)?;
             }
         }
@@ -241,8 +282,8 @@ fn query_disabled(db: &mut Option<Client>) -> HashSet<(String, Option<String>)> 
     // converted to Option types in Rust, the same inverse should be done on writes
     match db {
         None => HashSet::new(),
-        Some(db) =>
-            db.query("SELECT target, test FROM tests WHERE disabled = true", &[])
+        Some(db) => db
+            .query("SELECT target, test FROM tests WHERE disabled = true", &[])
             .unwrap()
             .into_iter()
             .map(|row| {
@@ -265,16 +306,16 @@ fn query_commit(db: &mut Option<Client>, revision: String, tests: &Vec<TestResul
             let insert_target = transaction.prepare(
                 "INSERT INTO targets (target)
                 VALUES ($1)
-                ON CONFLICT DO NOTHING"
+                ON CONFLICT DO NOTHING",
             )?;
             let insert_test = transaction.prepare(
                 "INSERT INTO tests (target, test, disabled)
                 VALUES ($1, $2, false)
-                ON CONFLICT DO NOTHING"
+                ON CONFLICT DO NOTHING",
             )?;
             let insert_result = transaction.prepare(
                 "INSERT INTO results (revision, target, test, passed)
-                VALUES ($1, $2, $3, $4)"
+                VALUES ($1, $2, $3, $4)",
             )?;
             let select_last_3 = transaction.prepare(
                 "SELECT test.passed as passed
@@ -283,19 +324,19 @@ fn query_commit(db: &mut Option<Client>, revision: String, tests: &Vec<TestResul
                 AND test.test = $2
                 AND run.revision = test.revision
                 ORDER BY run.time DESC
-                LIMIT 3"
+                LIMIT 3",
             )?;
             let update_disabled = transaction.prepare(
                 "UPDATE tests
                 SET disabled = $3
                 WHERE target = $1
-                AND test = $2"
+                AND test = $2",
             )?;
 
             transaction.execute(
                 "INSERT INTO runs (revision)
                 VALUES ($1)",
-                &[&revision]
+                &[&revision],
             )?;
             for test in tests {
                 let target = &test.target;
@@ -306,11 +347,13 @@ fn query_commit(db: &mut Option<Client>, revision: String, tests: &Vec<TestResul
                 transaction.execute(&insert_result, &[&revision, target, unit, &test.passed])?;
 
                 // auto-disable tests which, after this run, have failed 3 or more times in a row
-                let disabled = transaction.query(&select_last_3, &[target, unit])?
+                let disabled = transaction
+                    .query(&select_last_3, &[target, unit])?
                     .into_iter()
                     .map(|row| row.get("passed"))
                     .filter(|passed: &bool| !passed)
-                    .count() >= 3;
+                    .count()
+                    >= 3;
                 transaction.execute(&update_disabled, &[target, unit, &disabled])?;
             }
 
