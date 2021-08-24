@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use itertools::Itertools;
 use rayon::iter::*;
 use structopt::{clap, StructOpt};
-use postgres::{Client, NoTls, IsolationLevel};
+use postgres::{Client, NoTls};
 
 // we declare all modules here so that they may refer to each other using `super::<mod>`
 mod buck_test;
@@ -259,21 +259,59 @@ fn query_commit(db: &mut Option<Client>, revision: String, tests: &Vec<TestResul
     match db {
         None => Ok(()),
         Some(db) => {
-            let mut transaction = db.build_transaction()
-                .isolation_level(IsolationLevel::RepeatableRead)
-                .start()?;
+            let mut transaction = db.transaction()?;
 
             // we assume PostgreSQL > 9.5 in order to use <ON CONFLICT>
-            transaction.execute("INSERT INTO runs (revision) VALUES ($1)", &[&revision])?;
+            let insert_target = transaction.prepare(
+                "INSERT INTO targets (target)
+                VALUES ($1)
+                ON CONFLICT DO NOTHING"
+            )?;
+            let insert_test = transaction.prepare(
+                "INSERT INTO tests (target, test, disabled)
+                VALUES ($1, $2, false)
+                ON CONFLICT DO NOTHING"
+            )?;
+            let insert_result = transaction.prepare(
+                "INSERT INTO results (revision, target, test, passed)
+                VALUES ($1, $2, $3, $4)"
+            )?;
+            let select_last_3 = transaction.prepare(
+                "SELECT test.passed as passed
+                FROM results test, runs run
+                WHERE test.target = $1
+                AND test.test = $2
+                AND run.revision = test.revision
+                ORDER BY run.time DESC
+                LIMIT 3"
+            )?;
+            let update_disabled = transaction.prepare(
+                "UPDATE tests
+                SET disabled = $3
+                WHERE target = $1
+                AND test = $2"
+            )?;
+
+            transaction.execute(
+                "INSERT INTO runs (revision)
+                VALUES ($1)",
+                &[&revision]
+            )?;
             for test in tests {
                 let target = &test.target;
-                transaction.execute("INSERT INTO targets (target) VALUES ($1) ON CONFLICT DO NOTHING", &[target])?;
                 let unit = &test.unit.as_deref().unwrap_or(&"").to_string();
-                transaction.execute("INSERT INTO tests (target, test, disabled) VALUES ($1, $2, false) ON CONFLICT DO NOTHING", &[target, unit])?;
-                if test.attempts > 0 {
-                    let passing = test.passed;
-                    transaction.execute("INSERT INTO results (revision, target, test, passing) VALUES ($1, $2, $3, $4)", &[&revision, target, unit, &passing])?;
-                }
+
+                transaction.execute(&insert_target, &[target])?;
+                transaction.execute(&insert_test, &[target, unit])?;
+                transaction.execute(&insert_result, &[&revision, target, unit, &test.passed])?;
+
+                // auto-disable tests which, after this run, have failed 3 or more times in a row
+                let disabled = transaction.query(&select_last_3, &[target, unit])?
+                    .into_iter()
+                    .map(|row| row.get("passed"))
+                    .filter(|passed: &bool| !passed)
+                    .count() >= 3;
+                transaction.execute(&update_disabled, &[target, unit, &disabled])?;
             }
 
             transaction.commit()?;
