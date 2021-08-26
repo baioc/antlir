@@ -47,7 +47,7 @@ struct Options {
     #[structopt(long = "db")]
     conn: Option<String>,
 
-    /// Commit SHA-1 used to update the test DB on stateful runs
+    /// Commit hash used to update the test DB on stateful runs
     #[structopt(long = "commit", requires("conn"))]
     revision: Option<String>,
 
@@ -245,7 +245,7 @@ fn report<P: AsRef<Path>>(tests: &Vec<TestResult>, path: P) -> Result<()> {
                 xml,
                 r#"    <testcase classname="{}" name="{}" time="{}""#,
                 &test.target,
-                &test.unit,
+                &test.unitCommit SHA-1 used to update the test DB on stateful runs,
                 test.duration.as_millis() as f32 / 1e3
             )?;
             if test.passed {
@@ -335,7 +335,8 @@ fn query_commit(db: &mut Option<Client>, revision: String, tests: &Vec<TestResul
 
             transaction.execute(
                 "INSERT INTO runs (revision)
-                VALUES ($1)",
+                VALUES ($1)
+                ON CONFLICT UPDATE",
                 &[&revision],
             )?;
             for test in tests {
