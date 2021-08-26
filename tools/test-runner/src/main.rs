@@ -183,20 +183,18 @@ fn main() -> Result<()> {
     );
 
     // generate outputs
-    match options.report {
-        None => (),
-        Some(path) => report(&tests, path)?,
+    if let Some(path) = options.report {
+        report(&tests, path)?;
     }
-    match options.revision {
-        None => (),
-        Some(revision) => query_commit(&mut db, revision, &tests)?,
+    if let Some(revision) = options.revision {
+        commit_test_results(&mut db, revision, &tests)?;
     }
 
     exit(failed as i32);
 }
 
 // Refer to https://llg.cubic.org/docs/junit/
-fn report<P: AsRef<Path>>(tests: &Vec<TestResult>, path: P) -> Result<()> {
+fn report<P: AsRef<Path>>(tests: &[TestResult], path: P) -> Result<()> {
     let path = path.as_ref();
     let file = File::create(&path).with_context(|| {
         format!(
@@ -299,7 +297,7 @@ fn query_disabled(db: &mut Option<Client>) -> HashSet<(String, String)> {
     }
 }
 
-fn query_commit(db: &mut Option<Client>, revision: String, tests: &Vec<TestResult>) -> Result<()> {
+fn commit_test_results(db: &mut Option<Client>, revision: String, tests: &[TestResult]) -> Result<()> {
     match db {
         None => Ok(()),
         Some(db) => {
