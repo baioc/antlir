@@ -93,13 +93,13 @@ fn main() -> Result<()> {
         exit(0);
     }
 
-    // connect to DB when it is provided
+    // connect to DB when provided. we handle errors manually to avoid leaking credentials
     let mut db = match options.conn {
         None => None,
-        Some(ref uri) => Some(
-            Client::connect(&uri, NoTls)
-                .with_context(|| format!("Couldn't connect to specified test DB at '{}'", uri))?,
-        ),
+        Some(ref uri) => match Client::connect(&uri, NoTls) {
+            Ok(connection) => Some(connection),
+            Err(_) => panic!("Couldn't connect to specified test DB"),
+        },
     };
     let disabled = query_disabled(&mut db);
 
