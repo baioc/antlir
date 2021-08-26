@@ -23,7 +23,7 @@ mod buck_test;
 mod pyunit;
 mod rust;
 
-use buck_test::{Test, TestResult};
+use buck_test::{Test, TestResult,TestStatus};
 
 #[derive(StructOpt, Debug)]
 #[structopt(
@@ -109,19 +109,19 @@ fn main() -> Result<()> {
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads)
         .build_global();
-    let mut tests: Vec<TestResult> = tests
+    let tests: Vec<TestResult> = tests
         .into_par_iter()
         .map(|test| {
-            let run = !disabled.contains(&(test.target.clone(), test.unit.clone()))
+            let should_run = !disabled.contains(&(test.target.clone(), test.unit.clone()))
                 || options.run_disabled;
-            let test = if run {
-                test.run(options.retries)
-            } else {
-                TestResult {
+
+            let test = match should_run {
+                true => test.run(options.retries),
+                false => TestResult {
                     target: test.target,
                     unit: test.unit,
+                    status: TestStatus::Disabled,
                     attempts: 0,
-                    passed: false,
                     duration: Duration::ZERO,
                     stdout: "".to_string(),
                     stderr: "".to_string(),
@@ -130,56 +130,56 @@ fn main() -> Result<()> {
             };
 
             let name = format!("{}#{}", test.target, test.unit);
-            if test.passed {
-                print!("[PASS] {} ({} ms)", name, test.duration.as_millis());
-                if test.attempts > 1 {
-                    print!(" ({} attempts needed)\n", test.attempts);
-                } else {
-                    print!("\n");
-                }
-            } else if test.attempts == 0 {
-                println!("[SKIP] {}", name);
-            } else {
-                println!("[FAIL] {} ({} ms)", name, test.duration.as_millis());
+            match test.status {
+                TestStatus::Pass => {
+                    print!("[OK] {} ({} ms)", name, test.duration.as_millis());
+                    if test.attempts > 1 {
+                        print!(" ({} attempts needed)\n", test.attempts);
+                    } else {
+                        print!("\n");
+                    }
+                },
+                TestStatus::Fail => {
+                    println!("[FAIL] {} ({} ms)", name, test.duration.as_millis());
+                },
+                TestStatus::Disabled => {
+                    println!("[DISABLED] {}", name);
+                },
             }
-
             return test;
         })
         .collect();
 
     // collect and print results
-    let mut passed = 0;
-    let mut skipped = 0;
-    let mut errors: Vec<String> = Vec::new();
-    for test in tests.iter_mut() {
-        if test.passed {
-            passed += 1;
-        } else if test.attempts == 0 {
-            skipped += 1;
-        } else {
-            let mut message = format!(
-                "\nTest {}#{} failed after {} unsuccessful attempts:\n",
-                test.target, test.unit,
-                test.attempts
-            );
-            for line in test.stderr.split("\n") {
-                let line = format!("    {}\n", line);
-                message.push_str(&line);
+    let (passed, errors, disabled) = tests.iter()
+        .fold((0, Vec::new(), 0), |(passed, mut errors, disabled), test| match test.status {
+            TestStatus::Pass => (passed + 1, errors, disabled),
+            TestStatus::Disabled => (passed, errors, disabled + 1),
+            TestStatus::Fail => {
+                let mut message = format!(
+                    "\nTest {}#{} failed after {} unsuccessful attempts:\n",
+                    test.target, test.unit,
+                    test.attempts
+                );
+                for line in test.stderr.split("\n") {
+                    let line = format!("    {}\n", line);
+                    message.push_str(&line);
+                }
+                if test.contacts.len() > 0 {
+                    let contacts = format!("Please report this to {:?}\n", test.contacts);
+                    message.push_str(&contacts);
+                }
+                errors.push(message);
+                (passed, errors, disabled)
             }
-            if test.contacts.len() > 0 {
-                let contacts = format!("Please report this to {:?}\n", test.contacts);
-                message.push_str(&contacts);
-            }
-            errors.push(message);
-        }
-    }
+        });
     let failed = errors.len();
     for error in errors {
         eprintln!("{}", error);
     }
     println!(
-        "Out of {} tests, {} passed, {} failed, {} were skipped",
-        total, passed, failed, skipped
+        "Out of {} tests, {} passed, {} failed, {} are disabled",
+        total, passed, failed, disabled
     );
 
     // generate outputs
@@ -208,7 +208,7 @@ fn report<P: AsRef<Path>>(tests: &Vec<TestResult>, path: P) -> Result<()> {
 
     let failures = tests
         .iter()
-        .filter(|test| !test.passed && test.attempts > 0)
+        .filter(|test| match test.status { TestStatus::Fail => true, _ => false })
         .count();
     writeln!(xml, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
     writeln!(
@@ -225,11 +225,11 @@ fn report<P: AsRef<Path>>(tests: &Vec<TestResult>, path: P) -> Result<()> {
     for (target, cases) in suites {
         let failures = cases
             .iter()
-            .filter(|test| !test.passed && test.attempts > 0)
+            .filter(|test| match test.status { TestStatus::Fail => true, _ => false })
             .count();
         let skipped = cases
             .iter()
-            .filter(|test| !test.passed && test.attempts == 0)
+            .filter(|test| test.attempts == 0)
             .count();
         writeln!(
             xml,
@@ -245,29 +245,32 @@ fn report<P: AsRef<Path>>(tests: &Vec<TestResult>, path: P) -> Result<()> {
                 xml,
                 r#"    <testcase classname="{}" name="{}" time="{}""#,
                 &test.target,
-                &test.unitCommit SHA-1 used to update the test DB on stateful runs,
+                &test.unit,
                 test.duration.as_millis() as f32 / 1e3
             )?;
-            if test.passed {
-                writeln!(xml, " />")?;
-            } else {
-                writeln!(xml, r#">"#)?;
-                writeln!(
-                    xml,
-                    r#"      <failure>Test failed after {} unsuccessful attempts</failure>"#,
-                    test.attempts
-                )?;
-                writeln!(
-                    xml,
-                    r#"      <system-out>{}</system-out>"#,
-                    xml_escape_text(&test.stdout)
-                )?;
-                writeln!(
-                    xml,
-                    r#"      <system-err>{}</system-err>"#,
-                    xml_escape_text(&test.stderr)
-                )?;
-                writeln!(xml, r#"    </testcase>"#)?;
+            match test.status {
+                TestStatus::Disabled | TestStatus::Pass => {
+                    writeln!(xml, " />")?;
+                },
+                TestStatus::Fail => {
+                    writeln!(xml, r#">"#)?;
+                    writeln!(
+                        xml,
+                        r#"      <failure>Test failed after {} unsuccessful attempts</failure>"#,
+                        test.attempts
+                    )?;
+                    writeln!(
+                        xml,
+                        r#"      <system-out>{}</system-out>"#,
+                        xml_escape_text(&test.stdout)
+                    )?;
+                    writeln!(
+                        xml,
+                        r#"      <system-err>{}</system-err>"#,
+                        xml_escape_text(&test.stderr)
+                    )?;
+                    writeln!(xml, r#"    </testcase>"#)?;
+                }
             }
         }
 
@@ -315,7 +318,8 @@ fn query_commit(db: &mut Option<Client>, revision: String, tests: &Vec<TestResul
             )?;
             let insert_result = transaction.prepare(
                 "INSERT INTO results (revision, target, test, passed)
-                VALUES ($1, $2, $3, $4)",
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT DO NOTHING",
             )?;
             let select_last_3 = transaction.prepare(
                 "SELECT test.passed as passed
@@ -336,16 +340,17 @@ fn query_commit(db: &mut Option<Client>, revision: String, tests: &Vec<TestResul
             transaction.execute(
                 "INSERT INTO runs (revision)
                 VALUES ($1)
-                ON CONFLICT UPDATE",
+                ON CONFLICT (revision) DO UPDATE SET time = CURRENT_TIMESTAMP",
                 &[&revision],
             )?;
             for test in tests {
                 let target = &test.target;
                 let unit = &test.unit;
+                let passed = match test.status { TestStatus::Pass => true, _ => false };
 
                 transaction.execute(&insert_target, &[target])?;
                 transaction.execute(&insert_test, &[target, unit])?;
-                transaction.execute(&insert_result, &[&revision, target, unit, &test.passed])?;
+                transaction.execute(&insert_result, &[&revision, target, unit, &passed])?;
 
                 // auto-disable tests which, after this run, have failed 3 or more times in a row
                 let disabled = transaction

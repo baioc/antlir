@@ -60,12 +60,19 @@ pub enum TestKind {
 /// Labels which mark buck test targets for automatic (and silent) exclusion.
 const EXCLUDED_LABELS: &[&str] = &["disabled", "exclude_test_if_transitive_dep"];
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub enum TestStatus {
+    Pass,
+    Fail,
+    Disabled,
+}
+
+#[derive(Debug, Clone)]
 pub struct TestResult {
     pub target: String,
     pub unit: String,
+    pub status: TestStatus,
     pub attempts: u32,
-    pub passed: bool,
     pub duration: Duration,
     pub stdout: String,
     pub stderr: String,
@@ -96,8 +103,8 @@ impl Test {
                 return TestResult {
                     target: self.target,
                     unit: self.unit,
+                    status: TestStatus::Pass,
                     attempts,
-                    passed: true,
                     duration,
                     stdout: out,
                     stderr: err,
@@ -112,8 +119,8 @@ impl Test {
                     return TestResult {
                         target: self.target,
                         unit: self.unit,
+                        status: TestStatus::Fail,
                         attempts,
-                        passed: false,
                         duration,
                         stdout: out,
                         stderr: err,
