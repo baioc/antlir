@@ -43,11 +43,11 @@ struct Options {
     #[structopt(long = "xml")]
     report: Option<PathBuf>,
 
-    /// Connection string of the DB used in stateful test runs
+    /// Connection string of the DB used in stateful test runs. Defaults to read-only
     #[structopt(long = "db")]
     conn: Option<String>,
 
-    /// Commit hash used to update the test DB on stateful runs
+    /// Revision identifier that enables writing results to the test DB
     #[structopt(long = "commit", requires("conn"))]
     revision: Option<String>,
 
