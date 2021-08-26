@@ -23,7 +23,7 @@ mod buck_test;
 mod pyunit;
 mod rust;
 
-use buck_test::{test_name, Test, TestResult};
+use buck_test::{Test, TestResult};
 
 #[derive(StructOpt, Debug)]
 #[structopt(
@@ -88,7 +88,7 @@ fn main() -> Result<()> {
     // don't run anything when just listing
     if options.list {
         for test in tests {
-            println!("{}", test_name(&test.target, &test.unit));
+            println!("{}#{}", test.target, test.unit);
         }
         exit(0);
     }
@@ -129,7 +129,7 @@ fn main() -> Result<()> {
                 }
             };
 
-            let name = test_name(&test.target, &test.unit);
+            let name = format!("{}#{}", test.target, test.unit);
             if test.passed {
                 print!("[PASS] {} ({} ms)", name, test.duration.as_millis());
                 if test.attempts > 1 {
@@ -158,8 +158,8 @@ fn main() -> Result<()> {
             skipped += 1;
         } else {
             let mut message = format!(
-                "\nTest {} failed after {} unsuccessful attempts:\n",
-                test_name(&test.target, &test.unit),
+                "\nTest {}#{} failed after {} unsuccessful attempts:\n",
+                test.target, test.unit,
                 test.attempts
             );
             for line in test.stderr.split("\n") {
@@ -245,7 +245,7 @@ fn report<P: AsRef<Path>>(tests: &Vec<TestResult>, path: P) -> Result<()> {
                 xml,
                 r#"    <testcase classname="{}" name="{}" time="{}""#,
                 &test.target,
-                test.unit.as_ref().unwrap_or(&test.target),
+                &test.unit,
                 test.duration.as_millis() as f32 / 1e3
             )?;
             if test.passed {
@@ -284,21 +284,14 @@ fn xml_escape_text(unescaped: &String) -> String {
     return unescaped.replace("<", "&lt;").replace("&", "&amp;");
 }
 
-fn query_disabled(db: &mut Option<Client>) -> HashSet<(String, Option<String>)> {
-    // we have unit test name as NOT NULL in the DB, so empty SQL strings are
-    // converted to Option types in Rust. the inverse should be done when inserting
+fn query_disabled(db: &mut Option<Client>) -> HashSet<(String, String)> {
     match db {
         None => HashSet::new(),
         Some(db) => db
             .query("SELECT target, test FROM tests WHERE disabled = true", &[])
             .unwrap()
             .into_iter()
-            .map(|row| {
-                let target = row.get("target");
-                let test = row.get("test");
-                let test = if test == "" { None } else { Some(test) };
-                return (target, test);
-            })
+            .map(|row| (row.get("target"), row.get("test")))
             .collect(),
     }
 }
@@ -347,7 +340,7 @@ fn query_commit(db: &mut Option<Client>, revision: String, tests: &Vec<TestResul
             )?;
             for test in tests {
                 let target = &test.target;
-                let unit = &test.unit.as_deref().unwrap_or(&"").to_string();
+                let unit = &test.unit;
 
                 transaction.execute(&insert_target, &[target])?;
                 transaction.execute(&insert_test, &[target, unit])?;
