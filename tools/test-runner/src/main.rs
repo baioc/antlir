@@ -14,9 +14,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use itertools::Itertools;
-use postgres::{Client, NoTls};
 use rayon::iter::*;
 use structopt::{clap, StructOpt};
+use mysql_async::prelude::*;
+use mysql_async::Conn;
 
 // we declare all modules here so that they may refer to each other using `super::<mod>`
 mod buck_test;
@@ -68,7 +69,8 @@ struct Options {
     ignored: Vec<String>,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // parse command line
     let options = Options::from_args();
     if options.ignored.len() > 0 {
@@ -96,12 +98,14 @@ fn main() -> Result<()> {
     // connect to DB when provided. we handle errors manually to avoid leaking credentials
     let mut db = match options.conn {
         None => None,
-        Some(ref uri) => match Client::connect(&uri, NoTls) {
-            Ok(connection) => Some(connection),
-            Err(_) => panic!("Couldn't connect to specified test DB"),
+        Some(ref uri) => {
+            match Conn::from_url(uri).await {
+                Ok(connection) => Some(connection),
+                Err(_) => panic!("Couldn't connect to specified test DB"),
+            }
         },
     };
-    let disabled = query_disabled(&mut db);
+    let disabled = query_disabled(&mut db).await;
 
     // run tests in parallel (retries share the same thread)
     let total = tests.len();
@@ -187,7 +191,12 @@ fn main() -> Result<()> {
         report(&tests, path)?;
     }
     if let Some(revision) = options.revision {
-        commit_test_results(&mut db, revision, &tests)?;
+        commit_test_results(&mut db, revision, &tests).await?;
+    }
+
+    // drop connection and disconnect the pool
+    if let Some(connection) = db {
+        connection.disconnect().await?;
     }
 
     exit(failed as i32);
@@ -285,83 +294,85 @@ fn xml_escape_text(unescaped: &String) -> String {
     return unescaped.replace("<", "&lt;").replace("&", "&amp;");
 }
 
-fn query_disabled(db: &mut Option<Client>) -> HashSet<(String, String)> {
+async fn query_disabled(db: &mut Option<Conn>) -> HashSet<(String, String)> {
     match db {
         None => HashSet::new(),
         Some(db) => db
-            .query("SELECT target, test FROM tests WHERE disabled = true", &[])
+            .query("SELECT target, test FROM tests WHERE disabled = true").await
             .unwrap()
             .into_iter()
-            .map(|row| (row.get("target"), row.get("test")))
             .collect(),
     }
 }
 
-fn commit_test_results(db: &mut Option<Client>, revision: String, tests: &[TestResult]) -> Result<()> {
+async fn commit_test_results(db: &mut Option<Conn>, revision: String, tests: &[TestResult]) -> Result<()> {
     match db {
         None => Ok(()),
         Some(db) => {
-            let mut transaction = db.transaction()?;
+            // NOTE: INSERT IGNORE and ON DUPLICATE are MySQL-specific ways to upsert
+            db.exec_drop(
+                "INSERT INTO runs (revision)
+                VALUES (:revision)
+                ON DUPLICATE KEY UPDATE time = CURRENT_TIMESTAMP",
+                params! {
+                    "revision" => &revision,
+                }
+            );
 
-            // we assume PostgreSQL >= 9.5 in order to use <ON CONFLICT>
-            let insert_target = transaction.prepare(
-                "INSERT INTO targets (target)
-                VALUES ($1)
-                ON CONFLICT DO NOTHING",
-            )?;
-            let insert_test = transaction.prepare(
-                "INSERT INTO tests (target, test, disabled)
-                VALUES ($1, $2, false)
-                ON CONFLICT DO NOTHING",
-            )?;
-            let insert_result = transaction.prepare(
-                "INSERT INTO results (revision, target, test, passed)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT DO NOTHING",
-            )?;
-            let select_last_3 = transaction.prepare(
+            let update_params: Vec<_> = tests.iter()
+                .map(|test| {
+                    let target = &test.target;
+                    let unit = &test.unit;
+                    let passed = match test.status { TestStatus::Pass => true, _ => false };
+                    params! {
+                        "revision" => &revision,
+                        "target" => target,
+                        "test" => unit,
+                        "passed" => passed,
+                    }
+                })
+                .collect();
+
+            db.exec_batch(
+                "INSERT IGNORE INTO targets (target)
+                VALUES (:target)
+                ;
+                INSERT IGNORE INTO tests (target, test, disabled)
+                VALUES (:target, :test, false)
+                ;
+                INSERT IGNORE INTO results (revision, target, test, passed)
+                VALUES (:revision, :target, :test, :passed)
+                ;",
+                update_params.iter()
+            ).await?;
+
+            let select_last_3 =
                 "SELECT test.passed as passed
                 FROM results test, runs run
-                WHERE test.target = $1
-                AND test.test = $2
+                WHERE test.target = :target
+                AND test.test = :test
                 AND run.revision = test.revision
                 ORDER BY run.time DESC
-                LIMIT 3",
-            )?;
-            let update_disabled = transaction.prepare(
+                LIMIT 3";
+
+            let update_disabled =
                 "UPDATE tests
-                SET disabled = $3
-                WHERE target = $1
-                AND test = $2",
-            )?;
+                SET disabled = :disabled
+                WHERE target = :target
+                AND test = :test";
 
-            transaction.execute(
-                "INSERT INTO runs (revision)
-                VALUES ($1)
-                ON CONFLICT (revision) DO UPDATE SET time = CURRENT_TIMESTAMP",
-                &[&revision],
-            )?;
             for test in tests {
-                let target = &test.target;
-                let unit = &test.unit;
-                let passed = match test.status { TestStatus::Pass => true, _ => false };
-
-                transaction.execute(&insert_target, &[target])?;
-                transaction.execute(&insert_test, &[target, unit])?;
-                transaction.execute(&insert_result, &[&revision, target, unit, &passed])?;
-
                 // auto-disable tests which, after this run, have failed 3 or more times in a row
-                let disabled = transaction
-                    .query(&select_last_3, &[target, unit])?
+                let disabled = db
+                    .exec(select_last_3, params!{ "target" => &test.target, "test" => &test.unit })
+                    .await?
                     .into_iter()
-                    .map(|row| row.get("passed"))
                     .filter(|passed: &bool| !passed)
                     .count()
                     >= 3;
-                transaction.execute(&update_disabled, &[target, unit, &disabled])?;
+                db.exec_drop(update_disabled, params!{ "target" => &test.target, "test" => &test.unit, "disabled" => disabled });
             }
 
-            transaction.commit()?;
             Ok(())
         }
     }
