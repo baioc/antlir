@@ -14,17 +14,17 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use itertools::Itertools;
-use rayon::iter::*;
-use structopt::{clap, StructOpt};
 use mysql_async::prelude::*;
 use mysql_async::Conn;
+use rayon::iter::*;
+use structopt::{clap, StructOpt};
 
 // we declare all modules here so that they may refer to each other using `super::<mod>`
 mod buck_test;
 mod pyunit;
 mod rust;
 
-use buck_test::{Test, TestResult,TestStatus};
+use buck_test::{Test, TestResult, TestStatus};
 
 #[derive(StructOpt, Debug)]
 #[structopt(
@@ -98,11 +98,9 @@ async fn main() -> Result<()> {
     // connect to DB when provided. we handle errors manually to avoid leaking credentials
     let mut db = match options.conn {
         None => None,
-        Some(ref uri) => {
-            match Conn::from_url(uri).await {
-                Ok(connection) => Some(connection),
-                Err(_) => panic!("Couldn't connect to specified test DB"),
-            }
+        Some(ref uri) => match Conn::from_url(uri).await {
+            Ok(connection) => Some(connection),
+            Err(_) => panic!("Couldn't connect to specified test DB"),
         },
     };
     let disabled = query_disabled(&mut db).await;
@@ -130,7 +128,7 @@ async fn main() -> Result<()> {
                     stdout: "".to_string(),
                     stderr: "".to_string(),
                     contacts: test.contacts,
-                }
+                },
             };
 
             let name = format!("{}#{}", test.target, test.unit);
@@ -142,28 +140,28 @@ async fn main() -> Result<()> {
                     } else {
                         print!("\n");
                     }
-                },
+                }
                 TestStatus::Fail => {
                     println!("[FAIL] {} ({} ms)", name, test.duration.as_millis());
-                },
+                }
                 TestStatus::Disabled => {
                     println!("[DISABLED] {}", name);
-                },
+                }
             }
             return test;
         })
         .collect();
 
     // collect and print results
-    let (passed, errors, disabled) = tests.iter()
-        .fold((0, Vec::new(), 0), |(passed, mut errors, disabled), test| match test.status {
+    let (passed, errors, disabled) = tests.iter().fold(
+        (0, Vec::new(), 0),
+        |(passed, mut errors, disabled), test| match test.status {
             TestStatus::Pass => (passed + 1, errors, disabled),
             TestStatus::Disabled => (passed, errors, disabled + 1),
             TestStatus::Fail => {
                 let mut message = format!(
                     "\nTest {}#{} failed after {} unsuccessful attempts:\n",
-                    test.target, test.unit,
-                    test.attempts
+                    test.target, test.unit, test.attempts
                 );
                 for line in test.stderr.split("\n") {
                     let line = format!("    {}\n", line);
@@ -176,7 +174,8 @@ async fn main() -> Result<()> {
                 errors.push(message);
                 (passed, errors, disabled)
             }
-        });
+        },
+    );
     let failed = errors.len();
     for error in errors {
         eprintln!("{}", error);
@@ -215,7 +214,10 @@ fn report<P: AsRef<Path>>(tests: &[TestResult], path: P) -> Result<()> {
 
     let failures = tests
         .iter()
-        .filter(|test| match test.status { TestStatus::Fail => true, _ => false })
+        .filter(|test| match test.status {
+            TestStatus::Fail => true,
+            _ => false,
+        })
         .count();
     writeln!(xml, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
     writeln!(
@@ -232,12 +234,12 @@ fn report<P: AsRef<Path>>(tests: &[TestResult], path: P) -> Result<()> {
     for (target, cases) in suites {
         let failures = cases
             .iter()
-            .filter(|test| match test.status { TestStatus::Fail => true, _ => false })
+            .filter(|test| match test.status {
+                TestStatus::Fail => true,
+                _ => false,
+            })
             .count();
-        let skipped = cases
-            .iter()
-            .filter(|test| test.attempts == 0)
-            .count();
+        let skipped = cases.iter().filter(|test| test.attempts == 0).count();
         writeln!(
             xml,
             r#"  <testsuite name="{}" tests="{}" failures="{}" skipped="{}">"#,
@@ -258,7 +260,7 @@ fn report<P: AsRef<Path>>(tests: &[TestResult], path: P) -> Result<()> {
             match test.status {
                 TestStatus::Disabled | TestStatus::Pass => {
                     writeln!(xml, " />")?;
-                },
+                }
                 TestStatus::Fail => {
                     writeln!(xml, r#">"#)?;
                     writeln!(
@@ -298,32 +300,33 @@ async fn query_disabled(db: &mut Option<Conn>) -> HashSet<(String, String)> {
     match db {
         None => HashSet::new(),
         Some(db) => db
-            .query("SELECT target, test FROM tests WHERE disabled = true").await
+            .query("SELECT target, test FROM tests WHERE disabled = true")
+            .await
             .unwrap()
             .into_iter()
             .collect(),
     }
 }
 
-async fn commit_test_results(db: &mut Option<Conn>, revision: String, tests: &[TestResult]) -> Result<()> {
+async fn commit_test_results(
+    db: &mut Option<Conn>,
+    revision: String,
+    tests: &[TestResult],
+) -> Result<()> {
     match db {
         None => Ok(()),
         Some(db) => {
             // NOTE: INSERT IGNORE and ON DUPLICATE are MySQL-specific ways to upsert
-            let insert_target =
-                "INSERT IGNORE INTO targets (target)
+            let insert_target = "INSERT IGNORE INTO targets (target)
                 VALUES (:target)";
 
-            let insert_test =
-                "INSERT IGNORE INTO tests (target, test, disabled)
+            let insert_test = "INSERT IGNORE INTO tests (target, test, disabled)
                 VALUES (:target, :test, false)";
 
-            let insert_result =
-                "INSERT IGNORE INTO results (revision, target, test, passed)
+            let insert_result = "INSERT IGNORE INTO results (revision, target, test, passed)
                 VALUES (:revision, :target, :test, :passed)";
 
-            let select_last_3 =
-                "SELECT test.passed as passed
+            let select_last_3 = "SELECT test.passed as passed
                 FROM results test, runs run
                 WHERE test.target = :target
                 AND test.test = :test
@@ -331,8 +334,7 @@ async fn commit_test_results(db: &mut Option<Conn>, revision: String, tests: &[T
                 ORDER BY run.time DESC
                 LIMIT 3";
 
-            let update_disabled =
-                "UPDATE tests
+            let update_disabled = "UPDATE tests
                 SET disabled = :disabled
                 WHERE target = :target
                 AND test = :test";
@@ -343,41 +345,64 @@ async fn commit_test_results(db: &mut Option<Conn>, revision: String, tests: &[T
                 ON DUPLICATE KEY UPDATE time = CURRENT_TIMESTAMP",
                 params! {
                     "revision" => &revision,
-                }
-            ).await?;
+                },
+            )
+            .await?;
             for test in tests {
-                let passed = match test.status { TestStatus::Pass => true, _ => false };
+                let passed = match test.status {
+                    TestStatus::Pass => true,
+                    _ => false,
+                };
 
-                db.exec_drop(insert_target, params! {
-                    "target" => &test.target,
-                }).await?;
-                db.exec_drop(insert_test, params! {
-                    "target" => &test.target,
-                    "test" => &test.unit,
-                }).await?;
-                db.exec_drop(insert_result, params! {
-                    "revision" => &revision,
-                    "target" => &test.target,
-                    "test" => &test.unit,
-                    "passed" => passed,
-                }).await?;
+                db.exec_drop(
+                    insert_target,
+                    params! {
+                        "target" => &test.target,
+                    },
+                )
+                .await?;
+                db.exec_drop(
+                    insert_test,
+                    params! {
+                        "target" => &test.target,
+                        "test" => &test.unit,
+                    },
+                )
+                .await?;
+                db.exec_drop(
+                    insert_result,
+                    params! {
+                        "revision" => &revision,
+                        "target" => &test.target,
+                        "test" => &test.unit,
+                        "passed" => passed,
+                    },
+                )
+                .await?;
 
                 // auto-disable tests which, after this run, have failed 3 or more times in a row
                 let disabled = db
-                    .exec(select_last_3, params! {
-                        "target" => &test.target,
-                        "test" => &test.unit
-                    })
+                    .exec(
+                        select_last_3,
+                        params! {
+                            "target" => &test.target,
+                            "test" => &test.unit
+                        },
+                    )
                     .await?
                     .into_iter()
                     .filter(|passed: &bool| !passed)
                     .count()
                     >= 3;
-                db.exec_drop(update_disabled, params!{
-                    "target" => &test.target,
-                    "test" => &test.unit,
-                    "disabled" => disabled
-                }).await?;
+                db.exec_drop(
+                    update_disabled,
+                    params! {
+                        "target" => &test.target,
+                        "test" => &test.unit,
+                        "disabled" => disabled
+                    },
+                )
+                .await?;
             }
 
             Ok(())
