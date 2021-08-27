@@ -2,7 +2,7 @@ BEGIN;
 
 CREATE TABLE runs(
   revision varchar(128) NOT NULL PRIMARY KEY,
-  time timestamp with time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
+  time timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE targets(

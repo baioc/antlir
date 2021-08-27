@@ -310,41 +310,17 @@ async fn commit_test_results(db: &mut Option<Conn>, revision: String, tests: &[T
         None => Ok(()),
         Some(db) => {
             // NOTE: INSERT IGNORE and ON DUPLICATE are MySQL-specific ways to upsert
-            db.exec_drop(
-                "INSERT INTO runs (revision)
-                VALUES (:revision)
-                ON DUPLICATE KEY UPDATE time = CURRENT_TIMESTAMP",
-                params! {
-                    "revision" => &revision,
-                }
-            );
-
-            let update_params: Vec<_> = tests.iter()
-                .map(|test| {
-                    let target = &test.target;
-                    let unit = &test.unit;
-                    let passed = match test.status { TestStatus::Pass => true, _ => false };
-                    params! {
-                        "revision" => &revision,
-                        "target" => target,
-                        "test" => unit,
-                        "passed" => passed,
-                    }
-                })
-                .collect();
-
-            db.exec_batch(
+            let insert_target =
                 "INSERT IGNORE INTO targets (target)
-                VALUES (:target)
-                ;
-                INSERT IGNORE INTO tests (target, test, disabled)
-                VALUES (:target, :test, false)
-                ;
-                INSERT IGNORE INTO results (revision, target, test, passed)
-                VALUES (:revision, :target, :test, :passed)
-                ;",
-                update_params.iter()
-            ).await?;
+                VALUES (:target)";
+
+            let insert_test =
+                "INSERT IGNORE INTO tests (target, test, disabled)
+                VALUES (:target, :test, false)";
+
+            let insert_result =
+                "INSERT IGNORE INTO results (revision, target, test, passed)
+                VALUES (:revision, :target, :test, :passed)";
 
             let select_last_3 =
                 "SELECT test.passed as passed
@@ -361,16 +337,47 @@ async fn commit_test_results(db: &mut Option<Conn>, revision: String, tests: &[T
                 WHERE target = :target
                 AND test = :test";
 
+            db.exec_drop(
+                "INSERT INTO runs (revision)
+                VALUES (:revision)
+                ON DUPLICATE KEY UPDATE time = CURRENT_TIMESTAMP",
+                params! {
+                    "revision" => &revision,
+                }
+            ).await?;
             for test in tests {
+                let passed = match test.status { TestStatus::Pass => true, _ => false };
+
+                db.exec_drop(insert_target, params! {
+                    "target" => &test.target,
+                }).await?;
+                db.exec_drop(insert_test, params! {
+                    "target" => &test.target,
+                    "test" => &test.unit,
+                }).await?;
+                db.exec_drop(insert_result, params! {
+                    "revision" => &revision,
+                    "target" => &test.target,
+                    "test" => &test.unit,
+                    "passed" => passed,
+                }).await?;
+
                 // auto-disable tests which, after this run, have failed 3 or more times in a row
                 let disabled = db
-                    .exec(select_last_3, params!{ "target" => &test.target, "test" => &test.unit })
+                    .exec(select_last_3, params! {
+                        "target" => &test.target,
+                        "test" => &test.unit
+                    })
                     .await?
                     .into_iter()
                     .filter(|passed: &bool| !passed)
                     .count()
                     >= 3;
-                db.exec_drop(update_disabled, params!{ "target" => &test.target, "test" => &test.unit, "disabled" => disabled });
+                db.exec_drop(update_disabled, params!{
+                    "target" => &test.target,
+                    "test" => &test.unit,
+                    "disabled" => disabled
+                }).await?;
             }
 
             Ok(())
