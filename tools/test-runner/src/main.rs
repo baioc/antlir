@@ -253,8 +253,14 @@ fn report<P: AsRef<Path>>(tests: &[TestResult], path: P) -> Result<()> {
                 test.duration.as_millis() as f32 / 1e3
             )?;
             match test.status {
-                TestStatus::Disabled | TestStatus::Pass => {
+                TestStatus::Pass => {
                     writeln!(xml, " />")?;
+                }
+                TestStatus::Disabled => {
+                    writeln!(xml, r#">"#)?;
+                    writeln!(xml, r#"      <skipped message="Automatically disabled by the test runner"/>"#)?;
+                    writeln!(xml, r#"    </testcase>"#)?;
+
                 }
                 TestStatus::Fail => {
                     writeln!(xml, r#">"#)?;
